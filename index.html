@@ -67,42 +67,250 @@ function resize(){
 window.addEventListener('resize', resize);
 resize();
 
-/* ---------- 音（Web Audio・その場合成） ---------- */
+/* ---------- 音（Web Audio・その場合成／音声ファイルは1本も使わない） ----------
+   設計:
+   1. 全ての音は master → destination を通す。銃声だけ「廃墟の残響」と
+      「向かいのビルからの返り」へ送り、夜の街の広さを出す
+   2. ゾンビの声はフォルマント合成（帯域3本）で母音を作る。単なる低音のブーンではなく
+      「喉から出ている」音にする
+   3. ゾンビの声は距離で音量と高域が変わり、左右へ振れる。姿が見えなくても
+      「どこに何体いるか」が音だけで分かる                                        */
 let AC = null;
 function ac(){ if(!AC){ try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } return AC; }
-function noiseBuf(sec){
+
+function noiseBuf(sec, pw){
   const a = ac(); const n = Math.floor(a.sampleRate*sec);
   const b = a.createBuffer(1,n,a.sampleRate); const d = b.getChannelData(0);
-  for(let i=0;i<n;i++) d[i] = (Math.random()*2-1) * Math.pow(1-i/n, 2.2);
+  for(let i=0;i<n;i++) d[i] = (Math.random()*2-1) * Math.pow(1-i/n, pw===undefined?2.2:pw);
   return b;
 }
+/* 廃墟の残響。ノイズ×指数減衰のインパルス応答をその場で作る（音源ファイル不要） */
+function irBuf(sec, decay){
+  const a = ac(); const n = Math.floor(a.sampleRate*sec);
+  const b = a.createBuffer(2,n,a.sampleRate);
+  for(let c=0;c<2;c++){
+    const d = b.getChannelData(c);
+    for(let i=0;i<n;i++){
+      const t = i/n;
+      const pre = t < .014 ? t/.014 : 1;      // 立ち上がりを遅らせる＝壁が遠い＝広い
+      d[i] = (Math.random()*2-1) * pre * Math.pow(1-t, decay);
+    }
+  }
+  return b;
+}
+
+let MASTER=null, REV=null, ECHO=null;
+function bus(){
+  const a = ac(); if(!a) return null;
+  if(!MASTER){
+    // DynamicsCompressor は実測で -13dB も持っていかれ、音全体が痩せた（測定値: ピーク 0.898→0.205）。
+    // リミッターに頼らず、銃声そのものを 0.75 前後へ収めて重なりの余地を残す
+    MASTER = a.createGain(); MASTER.gain.value = .72; MASTER.connect(a.destination);
+
+    // 残響（廃墟の壁）
+    REV = a.createConvolver(); REV.buffer = irBuf(2.1, 3.0);
+    const rg = a.createGain(); rg.gain.value = .50;
+    REV.connect(rg); rg.connect(MASTER);
+
+    // 返り（向かいのビル）。0.27秒遅れて高域が削れた複製が2〜3回返る
+    ECHO = a.createGain(); ECHO.gain.value = 1;
+    const dl = a.createDelay(1.0); dl.delayTime.value = .27;
+    const fb = a.createGain(); fb.gain.value = .34;
+    const lp = a.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value = 820;
+    const eg = a.createGain(); eg.gain.value = .42;
+    ECHO.connect(dl); dl.connect(lp); lp.connect(fb); fb.connect(dl);
+    lp.connect(eg); eg.connect(MASTER);
+  }
+  return MASTER;
+}
+/* node を dry / 残響 / 返り の3系統へ配る */
+function out(node, dry, wet, echo){
+  const a = ac(), m = bus(); if(!m) return;
+  const g = a.createGain(); g.gain.value = dry; node.connect(g); g.connect(m);
+  if(wet && REV){  const w = a.createGain(); w.gain.value = wet;  node.connect(w); w.connect(REV); }
+  if(echo && ECHO){const e = a.createGain(); e.gain.value = echo; node.connect(e); e.connect(ECHO); }
+}
+/* 左右の定位。古い iOS Safari に無い場合は素通し */
+function panner(v){
+  const a = ac();
+  if(!a.createStereoPanner) return null;
+  const p = a.createStereoPanner(); p.pan.value = Math.max(-1, Math.min(1, v)); return p;
+}
+
+/* ---- 銃声: ①撃発のクラック ②銃身から抜ける圧 ③腹に来る低音 ＋ 街の返り ---- */
 function shot(){
   const a = ac(); if(!a) return; const t = a.currentTime;
-  const s = a.createBufferSource(); s.buffer = noiseBuf(.35);
+
+  // ① クラック（0.05秒）。ここが無いと「布を叩く音」になる
+  const c = a.createBufferSource(); c.buffer = noiseBuf(.05, 1.1);
+  const cf = a.createBiquadFilter(); cf.type='highpass'; cf.frequency.value = 1900;
+  const cg = a.createGain();
+  cg.gain.setValueAtTime(.60,t); cg.gain.exponentialRampToValueAtTime(.001,t+.048);
+  c.connect(cf); cf.connect(cg); out(cg,1,.35,.55); c.start(t); c.stop(t+.06);
+
+  // ② ボディ。広い帯域を一気に閉じると「破裂して抜ける」形になる
+  const s = a.createBufferSource(); s.buffer = noiseBuf(.32);
   const f = a.createBiquadFilter(); f.type='lowpass';
-  f.frequency.setValueAtTime(2400,t); f.frequency.exponentialRampToValueAtTime(180,t+.3);
-  const g = a.createGain(); g.gain.setValueAtTime(.5,t); g.gain.exponentialRampToValueAtTime(.001,t+.35);
-  s.connect(f); f.connect(g); g.connect(a.destination); s.start(t); s.stop(t+.36);
+  f.frequency.setValueAtTime(3400,t); f.frequency.exponentialRampToValueAtTime(170,t+.28);
+  const g = a.createGain();
+  g.gain.setValueAtTime(.48,t); g.gain.exponentialRampToValueAtTime(.001,t+.32);
+  s.connect(f); f.connect(g); out(g,1,.75,.85); s.start(t); s.stop(t+.33);
+
+  // ③ 腹に来る低音
   const o = a.createOscillator(); o.type='sine';
-  o.frequency.setValueAtTime(110,t); o.frequency.exponentialRampToValueAtTime(38,t+.18);
-  const g2 = a.createGain(); g2.gain.setValueAtTime(.4,t); g2.gain.exponentialRampToValueAtTime(.001,t+.2);
-  o.connect(g2); g2.connect(a.destination); o.start(t); o.stop(t+.21);
+  o.frequency.setValueAtTime(145,t); o.frequency.exponentialRampToValueAtTime(33,t+.20);
+  const g2 = a.createGain();
+  g2.gain.setValueAtTime(.42,t); g2.gain.exponentialRampToValueAtTime(.001,t+.24);
+  o.connect(g2); out(g2,1,.20,.18); o.start(t); o.stop(t+.25);
 }
+
 function click(freq, dur, vol, type){
   const a = ac(); if(!a) return; const t = a.currentTime;
   const o = a.createOscillator(); o.type = type||'square'; o.frequency.setValueAtTime(freq,t);
   const g = a.createGain(); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(.001,t+dur);
-  o.connect(g); g.connect(a.destination); o.start(t); o.stop(t+dur+.02);
+  o.connect(g); out(g,1,.10,0); o.start(t); o.stop(t+dur+.02);
 }
-function groan(){
+
+/* ---- 金属音: ボルト操作・装填。短いノイズ＋高い倍音で「鉄が擦れて噛む」 ---- */
+function metal(freq, dur, vol){
   const a = ac(); if(!a) return; const t = a.currentTime;
+  const s = a.createBufferSource(); s.buffer = noiseBuf(dur, 1.5);
+  const f = a.createBiquadFilter(); f.type='bandpass'; f.frequency.value = freq; f.Q.value = 2.2;
+  const g = a.createGain(); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(.001,t+dur);
+  s.connect(f); f.connect(g); out(g,1,.22,0); s.start(t); s.stop(t+dur+.02);
+  const o = a.createOscillator(); o.type='square'; o.frequency.setValueAtTime(freq*1.5,t);
+  const g2 = a.createGain(); g2.gain.setValueAtTime(vol*.34,t); g2.gain.exponentialRampToValueAtTime(.001,t+dur*.6);
+  o.connect(g2); out(g2,1,.14,0); o.start(t); o.stop(t+dur);
+}
+
+/* ---- ゾンビの唸り: フォルマント合成 ----
+   母音は「共鳴する3つの帯域」で決まる。声帯（鋸波）＋かすれ（ノイズ）を
+   バンドパス3本に通すと、低音のブーンではなく「うぅ／おぉ」に聞こえる       */
+const VOWEL = [[560,830,2400],[440,1000,2250],[320,860,2200],[640,1180,2300]];  // あ・お・う・え
+function groan(z){
+  const a = ac(); if(!a) return; const t = a.currentTime;
+
+  // 距離で音量と高域、横位置で左右が決まる。姿が見えなくても群れの居場所が分かる
+  let vol = .22, pan = 0, cut = 2600;
+  if(z){
+    const near = Math.max(0, Math.min(1, 1 - (z.d - REACH) / 900));
+    vol = .07 + near*.30;
+    pan = (z.x - S.camX) / 900;
+    cut = 460 + near*2400;                    // 遠いほど高域が減る＝距離が出る
+  }
+  const V  = VOWEL[(Math.random()*VOWEL.length)|0];
+  const f0 = 58 + Math.random()*40;
+  const dur = .55 + Math.random()*.35;
+
+  // 声帯
   const o = a.createOscillator(); o.type='sawtooth';
-  o.frequency.setValueAtTime(70+Math.random()*30,t);
-  o.frequency.linearRampToValueAtTime(45,t+.5);
-  const f = a.createBiquadFilter(); f.type='lowpass'; f.frequency.value=420;
-  const g = a.createGain(); g.gain.setValueAtTime(0,t);
-  g.gain.linearRampToValueAtTime(.14,t+.1); g.gain.exponentialRampToValueAtTime(.001,t+.6);
-  o.connect(f); f.connect(g); g.connect(a.destination); o.start(t); o.stop(t+.62);
+  o.frequency.setValueAtTime(f0,t);
+  o.frequency.linearRampToValueAtTime(f0*.68, t+dur);
+  // 声が震える（生きていない喉）
+  const lfo = a.createOscillator(); lfo.type='sine'; lfo.frequency.value = 4.5 + Math.random()*3;
+  const lg = a.createGain(); lg.gain.value = f0*.07;
+  lfo.connect(lg); lg.connect(o.frequency);
+  // かすれ
+  const n = a.createBufferSource(); n.buffer = noiseBuf(dur, .6);
+  const ng = a.createGain(); ng.gain.value = .12;
+  n.connect(ng);
+
+  const mix = a.createGain(); mix.gain.value = 1;
+  o.connect(mix); ng.connect(mix);
+
+  // フォルマント3本
+  const amp = [1, .55, .22];
+  const sum = a.createGain(); sum.gain.value = 1;
+  for(let i=0;i<3;i++){
+    const bp = a.createBiquadFilter(); bp.type='bandpass';
+    bp.frequency.value = V[i] * (.9 + Math.random()*.2); bp.Q.value = 7;
+    const bg = a.createGain(); bg.gain.value = amp[i];
+    mix.connect(bp); bp.connect(bg); bg.connect(sum);
+  }
+  const lp = a.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value = cut;
+  const g = a.createGain();
+  g.gain.setValueAtTime(.0001,t);
+  g.gain.linearRampToValueAtTime(vol, t+.12);
+  g.gain.setValueAtTime(vol, t+dur*.55);
+  g.gain.exponentialRampToValueAtTime(.001, t+dur);
+
+  sum.connect(lp); lp.connect(g);
+  const p = panner(pan);
+  if(p){ g.connect(p); out(p, 1, .30, 0); } else out(g, 1, .30, 0);
+
+  o.start(t); lfo.start(t); n.start(t);
+  o.stop(t+dur+.05); lfo.stop(t+dur+.05); n.stop(t+dur+.05);
+}
+
+/* ---- 着弾: 頭は潰れる音、胴は鈍く重い音 ---- */
+function impact(head, z){
+  const a = ac(); if(!a) return; const t = a.currentTime;
+  const pan = z ? (z.x - S.camX)/900 : 0;
+  const dur = head ? .26 : .18;
+  const s = a.createBufferSource(); s.buffer = noiseBuf(dur, head ? 1.4 : 2.6);
+  const f = a.createBiquadFilter(); f.type = head ? 'bandpass' : 'lowpass';
+  f.frequency.setValueAtTime(head ? 900 : 700, t);
+  f.frequency.exponentialRampToValueAtTime(head ? 180 : 120, t+dur);
+  if(head) f.Q.value = 1.1;
+  const g = a.createGain();
+  g.gain.setValueAtTime(head ? .34 : .22, t); g.gain.exponentialRampToValueAtTime(.001, t+dur);
+  s.connect(f); f.connect(g);
+  const p = panner(pan);
+  if(p){ g.connect(p); out(p,1,.35,0); } else out(g,1,.35,0);
+  s.start(t); s.stop(t+dur+.02);
+
+  const o = a.createOscillator(); o.type='sine';
+  o.frequency.setValueAtTime(head ? 210 : 130, t);
+  o.frequency.exponentialRampToValueAtTime(head ? 44 : 38, t+dur);
+  const g2 = a.createGain();
+  g2.gain.setValueAtTime(head ? .26 : .18, t); g2.gain.exponentialRampToValueAtTime(.001,t+dur);
+  o.connect(g2); out(g2,1,.18,0); o.start(t); o.stop(t+dur+.02);
+}
+/* ---- 倒れた体が地面に落ちる ---- */
+function bodyFall(z){
+  const a = ac(); if(!a) return; const t = a.currentTime + .16;
+  const pan = z ? (z.x - S.camX)/900 : 0;
+  const s = a.createBufferSource(); s.buffer = noiseBuf(.30, 3.0);
+  const f = a.createBiquadFilter(); f.type='lowpass'; f.frequency.value = 300;
+  const g = a.createGain(); g.gain.setValueAtTime(.20,t); g.gain.exponentialRampToValueAtTime(.001,t+.30);
+  s.connect(f); f.connect(g);
+  const p = panner(pan);
+  if(p){ g.connect(p); out(p,1,.40,0); } else out(g,1,.40,0);
+  s.start(t); s.stop(t+.32);
+}
+
+/* ---- 肥大体の溜め: 低い唸りがせり上がる。「来る」という予告 ---- */
+function growl(z){
+  const a = ac(); if(!a) return; const t = a.currentTime;
+  const pan = z ? (z.x - S.camX)/900 : 0;
+  const o = a.createOscillator(); o.type='sawtooth';
+  o.frequency.setValueAtTime(36,t); o.frequency.exponentialRampToValueAtTime(98,t+.46);
+  const f = a.createBiquadFilter(); f.type='lowpass';
+  f.frequency.setValueAtTime(190,t); f.frequency.linearRampToValueAtTime(940,t+.46);
+  const g = a.createGain();
+  g.gain.setValueAtTime(.001,t);
+  g.gain.linearRampToValueAtTime(.32,t+.40); g.gain.exponentialRampToValueAtTime(.001,t+.55);
+  o.connect(f); f.connect(g);
+  const p = panner(pan);
+  if(p){ g.connect(p); out(p,1,.40,0); } else out(g,1,.40,0);
+  o.start(t); o.stop(t+.57);
+}
+/* ---- 突進の号砲 ---- */
+function roar(z){
+  const a = ac(); if(!a) return; const t = a.currentTime;
+  const pan = z ? (z.x - S.camX)/900 : 0;
+  const nz = a.createBufferSource(); nz.buffer = noiseBuf(.55, 1.2);
+  const f = a.createBiquadFilter(); f.type='bandpass'; f.frequency.value = 520; f.Q.value = 1.1;
+  const g = a.createGain(); g.gain.setValueAtTime(.34,t); g.gain.exponentialRampToValueAtTime(.001,t+.55);
+  nz.connect(f); f.connect(g);
+  const o = a.createOscillator(); o.type='square';
+  o.frequency.setValueAtTime(124,t); o.frequency.exponentialRampToValueAtTime(50,t+.40);
+  const g2 = a.createGain(); g2.gain.setValueAtTime(.22,t); g2.gain.exponentialRampToValueAtTime(.001,t+.45);
+  o.connect(g2);
+  const p = panner(pan);
+  if(p){ g.connect(p); g2.connect(p); out(p,1,.50,.18); }
+  else  { out(g,1,.50,.18); out(g2,1,.50,.18); }
+  nz.start(t); nz.stop(t+.57); o.start(t); o.stop(t+.47);
 }
 function buzz(ms){ navigator.vibrate && navigator.vibrate(ms||28); }
 function heart(){
@@ -111,7 +319,7 @@ function heart(){
   o.frequency.setValueAtTime(60,t); o.frequency.exponentialRampToValueAtTime(30,t+.13);
   const g = a.createGain(); g.gain.setValueAtTime(.0015,t);
   g.gain.linearRampToValueAtTime(.20,t+.02); g.gain.exponentialRampToValueAtTime(.001,t+.17);
-  o.connect(g); g.connect(a.destination); o.start(t); o.stop(t+.19);
+  o.connect(g); out(g,1,0,0); o.start(t); o.stop(t+.19);
 }
 function surgeSting(){
   const a = ac(); if(!a) return; const t = a.currentTime;
@@ -119,14 +327,14 @@ function surgeSting(){
   const f = a.createBiquadFilter(); f.type='lowpass';
   f.frequency.setValueAtTime(90,t); f.frequency.linearRampToValueAtTime(240,t+.6);
   const g = a.createGain(); g.gain.setValueAtTime(.34,t); g.gain.exponentialRampToValueAtTime(.001,t+1.0);
-  s.connect(f); f.connect(g); g.connect(a.destination); s.start(t); s.stop(t+1.02);
+  s.connect(f); f.connect(g); out(g,1,.45,0); s.start(t); s.stop(t+1.02);
 }
 function calmSting(){
   const a = ac(); if(!a) return; const t = a.currentTime;
   const o = a.createOscillator(); o.type='sine';
   o.frequency.setValueAtTime(180,t); o.frequency.exponentialRampToValueAtTime(96,t+.7);
   const g = a.createGain(); g.gain.setValueAtTime(.10,t); g.gain.exponentialRampToValueAtTime(.001,t+.75);
-  o.connect(g); g.connect(a.destination); o.start(t); o.stop(t+.77);
+  o.connect(g); out(g,1,.35,0); o.start(t); o.stop(t+.77);
 }
 
 /* ---------- 定数 ---------- */
@@ -160,7 +368,7 @@ function newGame(){
     tide:'march', tideT:2.4, tideMul:1, surgeFlash:0,
     flash:0, hurt:0, recoil:0, shake:0, ejectT:0,
     banner:'', bannerT:0, hits:0, shots:0,
-    spawnN:0
+    spawnN:0, invDebt:0
   };
 }
 newGame();
@@ -188,7 +396,9 @@ function nextTide(){
   if(n === 'surge'){
     S.banner = '群れが' + T.label; S.bannerT = 1.5;
     S.surgeFlash = 1; S.shake = Math.max(S.shake, .8);
-    surgeSting(); groan(); groan(); groan(); buzz(60);
+    surgeSting(); buzz(60);
+    // 唸りは群れの実体から鳴らす。左右にばらけて「囲まれている」が音で出る
+    S.zombies.filter(z=>z.alive).sort((a,b)=>a.d-b.d).slice(0,3).forEach(groan);
   } else if(n === 'calm'){
     S.banner = T.label; S.bannerT = 1.1;
     S.surgeFlash = 0; calmSting();
@@ -199,7 +409,9 @@ const TYPES = {
   // lg=個体突進の倍率 / sw=歩幅 / hu=猫背の深さ / ar=腕の前方リーチ
   walker:{hp:2, sp:26, w:46, col:'#3f5638', cloth:'#212a1c', lg:2.05, sw:1.00, hu:.055, ar:.95, name:'歩行体'},
   runner:{hp:1, sp:58, w:36, col:'#5f6b28', cloth:'#2b2917', lg:2.70, sw:1.55, hu:.115, ar:.30, name:'走行体'},
-  brute :{hp:4, sp:17, w:72, col:'#2d5045', cloth:'#1a2922', lg:1.35, sw:.72, hu:.085, ar:1.15, name:'巨躯体'}
+  brute :{hp:4, sp:17, w:72, col:'#2d5045', cloth:'#1a2922', lg:1.35, sw:.72, hu:.085, ar:1.15, name:'巨躯体'},
+  // 肥大体: 基礎速度は全種で最も遅いが、溜めのあと lg=7.0 で走行体を超える速度になる
+  bloater:{hp:5, sp:12, w:88, col:'#8c4a9e', cloth:'#8e2436', lg:7.0, sw:.58, hu:.055, ar:1.05, name:'肥大体'}
 };
 
 function spawn(){
@@ -207,10 +419,17 @@ function spawn(){
   let k = 'walker';
   if(S.wave >= 2 && r < .3) k = 'runner';
   if(S.wave >= 3 && r > .86) k = 'brute';
-  const T = TYPES[k];
-  // 3体に1体を「反転種」にする。乱数ではなく通し番号で数えるので比率が必ず 1/3 になる
+  // 出現比率は乱数ではなく通し番号で数える。運で偏らない
   S.spawnN++;
-  const inv = (S.spawnN % 3 === 0);
+  // 7体に1体は「肥大体」。種別ごと差し替えるので反転種にはしない（固有の赤紫を潰さないため）
+  const fat = (S.spawnN % 7 === 0);
+  let inv = (S.spawnN % 3 === 0);
+  // 21体目は両方に当たる。そこで落ちた反転種は「借り」として次の非肥大体へ繰り越す。
+  // これで 肥大体 1/7 と 反転種 1/3 の両方が長期的に厳密に成立する
+  if(fat && inv){ S.invDebt++; inv = false; }
+  else if(!fat && !inv && S.invDebt > 0){ inv = true; S.invDebt--; }
+  if(fat) k = 'bloater';
+  const T = TYPES[k];
   S.zombies.push({
     k, hp:T.hp, maxhp:T.hp,
     // 反転種: 色が反転し、左右に蛇行して近づく（狙いを外させる個体）
@@ -225,9 +444,9 @@ function spawn(){
     limp:(Math.random()<.55?1:-1)*(.25+Math.random()*.55),
     tilt:(Math.random()*2-1)*.20,
     tatter:Math.random()*6.28,
-    lungeT:1.2+Math.random()*3.2, lunge:1, lungeLeft:0
+    lungeT:1.2+Math.random()*3.2, lunge:1, lungeLeft:0, tell:0
   });
-  if(Math.random() < .5) groan();
+  if(Math.random() < .5) groan(S.zombies[S.zombies.length-1]);
 }
 
 /* ---------- 入力 ---------- */
@@ -273,7 +492,7 @@ function begin(){ const b = S.best; newGame(); S.best = b; S.mode='play'; startW
 /* ---------- 射撃 ---------- */
 function fire(){
   if(S.mode !== 'play' || S.cycle > 0 || S.reloading > 0) return;
-  if(S.ammo <= 0){ click(180,.06,.25,'square'); reload(); return; }
+  if(S.ammo <= 0){ metal(320,.10,.26); reload(); return; }
   S.ammo--; S.shots++; S.cycle = CYCLE_MS;
   S.flash = 1; S.recoil = 1; S.shake = 1;
   S.ejectT = .30;
@@ -312,15 +531,15 @@ function fire(){
     target.pts = (base + dBonus) * Math.min(5, S.combo);
     target.head = headshot;
     S.score += target.pts;
-    click(headshot?880:420, .1, .2, headshot?'triangle':'square');
+    impact(headshot, target); bodyFall(target);
   } else {
     S.combo = Math.max(0, S.combo);
-    click(300, .05, .14, 'sawtooth');
+    impact(false, target);
   }
 }
 function reload(){
   if(S.mode!=='play' || S.reloading > 0 || S.ammo === MAG) return;
-  S.reloading = RELOAD_MS; click(220,.05,.16,'square');
+  S.reloading = RELOAD_MS; metal(280,.16,.30); setTimeout(()=>metal(190,.14,.22), 190);
 }
 
 /* ---------- 銃の投影（一人称の前縮み） ----------
@@ -391,7 +610,7 @@ function ejectShell(){
     x:p[0], y:p[1], vx:110+Math.random()*100, vy:-200-Math.random()*100,
     life:.95, c:'#c9a44e', r:3
   });
-  click(1650, .035, .06, 'triangle');
+  metal(2600,.09,.13); setTimeout(()=>metal(2100,.07,.07), 210);
 }
 
 /* ---------- 投影 ---------- */
@@ -424,8 +643,8 @@ function update(dt){
   S.shake = Math.max(0, S.shake - dt * 3.4);
   S.hurt = Math.max(0, S.hurt - dt * 1.6);
   S.bannerT = Math.max(0, S.bannerT - dt);
-  if(S.cycle > 0){ S.cycle -= dt*1000; if(S.cycle <= 0) click(520,.04,.1,'square'); }
-  if(S.reloading > 0){ S.reloading -= dt*1000; if(S.reloading <= 0){ S.ammo = MAG; click(640,.06,.14,'square'); } }
+  if(S.cycle > 0){ S.cycle -= dt*1000; if(S.cycle <= 0) metal(760,.13,.22); }
+  if(S.reloading > 0){ S.reloading -= dt*1000; if(S.reloading <= 0){ S.ammo = MAG; metal(520,.15,.26); } }
 
   // ---- 呼吸と手ブレ（銃・照準・HUDが同じ amp を共有する） ----
   const canHold = S.steady && S.breath > 0;
@@ -482,16 +701,25 @@ function update(dt){
     const T = TYPES[z.k];
 
     // 個体の突進: 群れ全体の潮とは別に、一体ずつ不意に踏み込む
-    if(z.lungeLeft > 0){
+    if(z.tell > 0){
+      // 肥大体の溜め。ほぼ止まって体が沈む。ここが撃ち抜くための猶予 0.5 秒
+      z.tell -= dt;
+      z.lunge += (.12 - z.lunge) * Math.min(1, dt*7);
+      if(z.tell <= 0){ z.lungeLeft = 1.25 + Math.random()*.55; roar(z); buzz(70); }
+    } else if(z.lungeLeft > 0){
       z.lungeLeft -= dt;
-      z.lunge += (T.lg - z.lunge) * Math.min(1, dt*8);
-      if(z.lungeLeft <= 0) z.lungeT = (z.k==='runner' ? 1.1 : 2.4) + Math.random()*3.2;
+      z.lunge += (T.lg - z.lunge) * Math.min(1, dt*(z.k==='bloater' ? 14 : 8));
+      if(z.lungeLeft <= 0) z.lungeT = (z.k==='runner' ? 1.1 : z.k==='bloater' ? 3.2 : 2.4) + Math.random()*3.2;
     } else {
-      z.lunge += (1 - z.lunge) * Math.min(1, dt*2.4);
+      z.lunge += (1 - z.lunge) * Math.min(1, dt*(z.k==='bloater' ? 5.0 : 2.4));
       z.lungeT -= dt;
       if(z.lungeT <= 0){
-        z.lungeLeft = .40 + Math.random()*.70;
-        if(Math.random() < .55) groan();
+        // 肥大体だけは「予告してから」来る。理不尽にしないための溜め
+        if(z.k === 'bloater'){ z.tell = .50; growl(z); }
+        else {
+          z.lungeLeft = .40 + Math.random()*.70;
+          if(Math.random() < .55) groan(z);
+        }
       }
     }
 
@@ -634,6 +862,17 @@ function drawZombie(z){
   ctx.beginPath(); ctx.ellipse(0, 1, w*.66, h*.040, 0, 0, 6.29); ctx.fill();
   ctx.globalAlpha = ga;
 
+  // 肥大体の溜め: 足元の赤い輪が広がる。音を切っていても「来る」が分かる
+  const tell = Math.max(0, Math.min(1, (z.tell||0)/.50));
+  if(tell > 0){
+    ctx.globalAlpha = ga*(.22 + .55*(1-tell));
+    ctx.strokeStyle = '#ff3a55'; ctx.lineWidth = Math.max(1.2, w*.055);
+    ctx.beginPath();
+    ctx.ellipse(0, 1, w*(.62 + .55*(1-tell)), h*.048*(1 + (1-tell)*.5), 0, 0, 6.29);
+    ctx.stroke();
+    ctx.globalAlpha = ga;
+  }
+
   if(!dying) ctx.rotate(z.tilt * (z.k === 'runner' ? 1.5 : 1));
 
   const hit   = z.hitT > 0;
@@ -645,6 +884,8 @@ function drawZombie(z){
   // 上下動。引きずる脚のぶんだけ不均等に跳ねる
   const bob = Math.abs(Math.sin(g)) * h * .020 * (1 + Math.abs(z.limp)*.8);
   ctx.translate(0, -bob);
+  // 溜めで沈み込む → 解放した瞬間に伸び上がる
+  if(tell > 0){ ctx.translate(0, h*.09*tell); ctx.scale(1 + .07*tell, 1 - .12*tell); }
 
   // 頭の高さは全タイプ共通（ヘッドショット判定 top+.21h と一致させる）
   const hipY = -h*.50, shY = -h*.795, hr = h*.072;
