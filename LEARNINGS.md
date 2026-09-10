@@ -310,7 +310,19 @@ else if(!fat && !inv && S.invDebt > 0){ inv = true; S.invDebt--; }
 
 6. 不気味さは色ではなく**情報の少なさ**で出る。廃墟の窓を全部光らせると街になる。30%の建物に1〜2個だけ灯すと「まだ誰かいる」に変わる。
 
+### 仕上げ（同日・出荷パイプライン）
+
+出荷前の iOS 検査で2点の抜けを検出して塞いだ。**背景の作業とは無関係に前から抜けていた穴**で、パイプラインを通さなければ見つからなかった。
+
+- `-webkit-touch-callout:none` / `-webkit-user-select:none` 未指定 → 仮想ボタンの長押しでiOSのコピーメニューが出る
+- `.btn` に `touch-action` 未指定 → `touch-action:none` は html/body に効いていたが**継承されない**ため、ボタン上のダブルタップ拡大が生きていた
+- ついでに `overscroll-behavior:none` と `-webkit-text-size-adjust:100%` を追加
+
+**学び: `touch-action` は継承しない。** html/body に書いたから全体に効いている、は誤り。タップを受ける要素それぞれに要る。
+
+SPEC.md に「5-C. 背景」を新設し、3層の寸法・アンカー規約・月の描画順8段・毎フレーム描く3要素・不気味さの設計方針を記録した。
+
 ### 検証（証跡）
-- `_tools/game-harness.mjs 229-dead-range` → **RESULT PASS**（61 RAF/秒・コンソールエラー0・リクエスト失敗0・0.07MB）。レポート: `docs/harness-reports/229-dead-range-2026-09-10T12-15-46-738Z.md`
+- `_tools/game-harness.sh 229-dead-range` → **RESULT PASS（8/8）**（61 RAF/秒・コンソールエラー0・リクエスト失敗0・0.07MB）。レポート: `docs/harness-reports/229-dead-range-2026-09-10T12-19-51-001Z.md`
 - Playwright（390×844・DPR2）でタイトル／プレイ中／照準パン時の3枚をキャプチャし目視確認。視差差（近景が大きく動き月はほぼ動かない）を実画で確認済み
 - **未検証**: iPhone実機での確認、オフスクリーン3枚（約11MB相当）を抱えた状態での長時間プレイのメモリ挙動
